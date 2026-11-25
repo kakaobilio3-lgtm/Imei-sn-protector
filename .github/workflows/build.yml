@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
     steps:
       - uses: actions/checkout@v4
 
@@ -16,11 +18,21 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
-
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
+
+      - name: Android SDK paketlerini kur
+        run: |
+          set +o pipefail
+          SDKMGR="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1)"
+          if [ -z "$SDKMGR" ]; then
+            echo "sdkmanager bulunamadı. ANDROID_HOME içeriği:"
+            ls -R "$ANDROID_HOME" | head -n 50
+            exit 1
+          fi
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
       - name: Proje dosyalarını oluştur
         run: |
@@ -368,6 +380,8 @@ jobs:
 
       - name: Derle
         working-directory: SettingsGuard
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
         run: gradle :app:assembleDebug --no-daemon
 
       - name: APK'yı yükle

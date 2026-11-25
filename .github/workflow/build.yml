@@ -1,0 +1,377 @@
+name: Build Settings Guard
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Proje dosyalarını oluştur
+        run: |
+          set -e
+          ROOT="$GITHUB_WORKSPACE/SettingsGuard"
+          PKG="com/example/settingsguard"
+          mkdir -p "$ROOT/app/src/main/java/$PKG"
+          mkdir -p "$ROOT/app/src/main/assets"
+          mkdir -p "$ROOT/app/src/main/res/values"
+          cd "$ROOT"
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://api.xposed.info/") }
+              }
+          }
+
+          rootProject.name = "SettingsGuard"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.settingsguard"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.settingsguard"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              compileOnly("de.robv.android.xposed:api:82")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application android:label="Settings Guard">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+                  <meta-data
+                      android:name="xposeddescription"
+                      android:value="Ayarlar &gt; Telefon hakkında içindeki seri numarası ve IMEI bilgilerini biyometrik doğrulama arkasına gizler." />
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/assets/xposed_init <<'EOF'
+          com.example.settingsguard.HookEntry
+          EOF
+
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposedscope">
+                  <item>com.android.settings</item>
+              </string-array>
+          </resources>
+          EOF
+
+          cat > "app/src/main/java/$PKG/HookEntry.kt" <<'EOF'
+          package com.example.settingsguard
+
+          import de.robv.android.xposed.IXposedHookLoadPackage
+          import de.robv.android.xposed.XC_MethodHook
+          import de.robv.android.xposed.XposedBridge
+          import de.robv.android.xposed.XposedHelpers
+          import de.robv.android.xposed.callbacks.XC_LoadPackage
+
+          /** Anahtar/başlık loglamak için true yapıp LSPosed logundan gerçek anahtarları görebilirsin. */
+          const val LOG_KEYS = false
+
+          class HookEntry : IXposedHookLoadPackage {
+
+              override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
+                  if (lpparam.packageName != "com.android.settings") return
+
+                  val prefClass = try {
+                      XposedHelpers.findClass("androidx.preference.Preference", lpparam.classLoader)
+                  } catch (t: Throwable) {
+                      XposedBridge.log("SG: Preference sınıfı bulunamadı: ${t.message}")
+                      return
+                  }
+
+                  try {
+                      XposedHelpers.findAndHookMethod(
+                          prefClass, "setSummary", CharSequence::class.java, SummaryHook
+                      )
+                  } catch (t: Throwable) {
+                      XposedBridge.log("SG: setSummary hook'lanamadı: ${t.message}")
+                  }
+
+                  try {
+                      XposedHelpers.findAndHookMethod(prefClass, "performClick", ClickHook)
+                  } catch (t: Throwable) {
+                      XposedBridge.log("SG: performClick hook'lanamadı: ${t.message}")
+                  }
+
+                  XposedBridge.log("SG: Settings Guard aktif")
+              }
+
+              private object SummaryHook : XC_MethodHook() {
+                  override fun beforeHookedMethod(param: MethodHookParam) {
+                      val pref = param.thisObject ?: return
+                      val value = param.args[0] as? CharSequence ?: return
+
+                      if (LOG_KEYS) {
+                          XposedBridge.log(
+                              "SG pref key=${runCatching { XposedHelpers.callMethod(pref, "getKey") }.getOrNull()} " +
+                                  "title=${runCatching { XposedHelpers.callMethod(pref, "getTitle") }.getOrNull()} " +
+                                  "summary=$value"
+                          )
+                      }
+
+                      if (!Sensitive.isSensitive(pref)) return
+                      if (value.toString() == Guard.MASK) return
+                      if (Sensitive.isEmptyValue(value)) return
+
+                      Guard.real[pref] = value
+                      if (Guard.isUnlocked(pref)) return
+
+                      param.args[0] = Guard.MASK
+                  }
+              }
+
+              private object ClickHook : XC_MethodHook() {
+                  override fun beforeHookedMethod(param: MethodHookParam) {
+                      val pref = param.thisObject ?: return
+                      if (!Sensitive.isSensitive(pref)) return
+                      if (Guard.real[pref] == null) return
+                      if (Guard.isUnlocked(pref)) return
+
+                      param.result = null
+
+                      val ctx = runCatching {
+                          XposedHelpers.callMethod(pref, "getContext") as? android.content.Context
+                      }.getOrNull() ?: return
+                      val activity = ctx.findActivity() ?: return
+
+                      Auth.authenticate(activity) {
+                          Guard.reveal(pref)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > "app/src/main/java/$PKG/Sensitive.kt" <<'EOF'
+          package com.example.settingsguard
+
+          import de.robv.android.xposed.XposedHelpers
+
+          object Sensitive {
+
+              private val keywords = listOf("imei", "serial", "seri numar", "seri no")
+
+              private val emptyValues = setOf(
+                  "", "-", "--", "n/a", "na", "none", "unknown", "bilinmiyor", "bilinmeyen", "not available"
+              )
+
+              fun isSensitive(pref: Any): Boolean {
+                  val key = runCatching { XposedHelpers.callMethod(pref, "getKey") as? String }
+                      .getOrNull().orEmpty()
+                  val title = runCatching { XposedHelpers.callMethod(pref, "getTitle")?.toString() }
+                      .getOrNull().orEmpty()
+                  val haystack = "$key $title".lowercase()
+                  return keywords.any { haystack.contains(it) }
+              }
+
+              fun isEmptyValue(value: CharSequence): Boolean {
+                  val v = value.toString().trim().lowercase()
+                  return v.isEmpty() || v in emptyValues
+              }
+          }
+          EOF
+
+          cat > "app/src/main/java/$PKG/Guard.kt" <<'EOF'
+          package com.example.settingsguard
+
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import de.robv.android.xposed.XposedHelpers
+          import java.util.WeakHashMap
+
+          object Guard {
+
+              const val MASK = "••••••••"
+              private const val REVEAL_MS = 15_000L
+
+              val real = WeakHashMap<Any, CharSequence>()
+
+              private val unlockedUntil = WeakHashMap<Any, Long>()
+
+              fun isUnlocked(pref: Any): Boolean =
+                  (unlockedUntil[pref] ?: 0L) > SystemClock.elapsedRealtime()
+
+              fun reveal(pref: Any) {
+                  unlockedUntil[pref] = SystemClock.elapsedRealtime() + REVEAL_MS
+
+                  val value = real[pref] ?: return
+                  XposedHelpers.callMethod(pref, "setSummary", value)
+
+                  Handler(Looper.getMainLooper()).postDelayed({
+                      unlockedUntil.remove(pref)
+                      XposedHelpers.callMethod(pref, "setSummary", MASK)
+                  }, REVEAL_MS)
+              }
+          }
+          EOF
+
+          cat > "app/src/main/java/$PKG/Auth.kt" <<'EOF'
+          package com.example.settingsguard
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.ContextWrapper
+          import android.hardware.biometrics.BiometricManager
+          import android.hardware.biometrics.BiometricPrompt
+          import android.os.CancellationSignal
+          import android.widget.Toast
+
+          object Auth {
+
+              fun authenticate(activity: Activity, onSuccess: () -> Unit) {
+                  val bm = activity.getSystemService(BiometricManager::class.java)
+                  val can = bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                  if (can != BiometricManager.BIOMETRIC_SUCCESS) {
+                      Toast.makeText(
+                          activity,
+                          "Biyometrik doğrulama kullanılamıyor (kayıtlı parmak izi/yüz yok olabilir)",
+                          Toast.LENGTH_LONG
+                      ).show()
+                      return
+                  }
+
+                  val executor = activity.mainExecutor
+                  val prompt = BiometricPrompt.Builder(activity)
+                      .setTitle("Cihaz bilgileri")
+                      .setSubtitle("Seri numara / IMEI görüntülemek için doğrulayın")
+                      .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                      .setNegativeButton("İptal", executor) { _, _ -> }
+                      .build()
+
+                  prompt.authenticate(
+                      CancellationSignal(),
+                      executor,
+                      object : BiometricPrompt.AuthenticationCallback() {
+                          override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                              onSuccess()
+                          }
+                      }
+                  )
+              }
+          }
+
+          fun Context.findActivity(): Activity? {
+              var ctx: Context? = this
+              while (ctx != null) {
+                  if (ctx is Activity) return ctx
+                  ctx = (ctx as? ContextWrapper)?.baseContext
+              }
+              return null
+          }
+          EOF
+
+          cat > "app/src/main/java/$PKG/MainActivity.kt" <<'EOF'
+          package com.example.settingsguard
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(TextView(this).apply {
+                      text = "Settings Guard\n\nLSPosed'da bu modülü etkinleştirin, kapsam olarak " +
+                          "'Ayarlar' (com.android.settings) seçin ve Ayarlar uygulamasını yeniden başlatın."
+                      setPadding(48, 48, 48, 48)
+                      textSize = 16f
+                  })
+              }
+          }
+          EOF
+
+          ls -R "$ROOT"
+
+      - name: Derle
+        working-directory: SettingsGuard
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: APK'yı yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: settings-guard-debug
+          path: SettingsGuard/app/build/outputs/apk/debug/*.apk

@@ -24,7 +24,6 @@ jobs:
 
       - name: Android SDK paketlerini kur
         run: |
-          set +o pipefail
           SDKMGR="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -n1)"
           if [ -z "$SDKMGR" ]; then
             echo "sdkmanager bulunamadı. ANDROID_HOME içeriği:"
@@ -131,7 +130,7 @@ jobs:
                   <meta-data android:name="xposedminversion" android:value="93" />
                   <meta-data
                       android:name="xposeddescription"
-                      android:value="Ayarlar &gt; Telefon hakkında içindeki seri numarası ve IMEI bilgilerini biyometrik doğrulama arkasına gizler." />
+                      android:value="Ayarlar &gt; Telefon hakkında içindeki seri numarası, IMEI ve telefon numarasını biyometrik doğrulama arkasına gizler." />
 
               </application>
           </manifest>
@@ -153,13 +152,16 @@ jobs:
           cat > "app/src/main/java/$PKG/HookEntry.kt" <<'EOF'
           package com.example.settingsguard
 
+          import android.content.Context
+          import android.widget.EditText
+          import android.widget.TextView
           import de.robv.android.xposed.IXposedHookLoadPackage
           import de.robv.android.xposed.XC_MethodHook
           import de.robv.android.xposed.XposedBridge
           import de.robv.android.xposed.XposedHelpers
           import de.robv.android.xposed.callbacks.XC_LoadPackage
 
-          /** Anahtar/başlık loglamak için true yapıp LSPosed logundan gerçek anahtarları görebilirsin. */
+          /** true yaparsanız LSPosed logunda sayfa etiketleri ve görünüm sınıfları görünür (değerler loglanmaz). */
           const val LOG_KEYS = false
 
           class HookEntry : IXposedHookLoadPackage {
@@ -167,25 +169,22 @@ jobs:
               override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
                   if (lpparam.packageName != "com.android.settings") return
 
-                  val prefClass = try {
-                      XposedHelpers.findClass("androidx.preference.Preference", lpparam.classLoader)
-                  } catch (t: Throwable) {
-                      XposedBridge.log("SG: Preference sınıfı bulunamadı: ${t.message}")
-                      return
-                  }
-
                   try {
-                      XposedHelpers.findAndHookMethod(
-                          prefClass, "setSummary", CharSequence::class.java, SummaryHook
-                      )
-                  } catch (t: Throwable) {
-                      XposedBridge.log("SG: setSummary hook'lanamadı: ${t.message}")
-                  }
-
-                  try {
+                      val prefClass = XposedHelpers.findClass("androidx.preference.Preference", lpparam.classLoader)
+                      XposedHelpers.findAndHookMethod(prefClass, "setSummary", CharSequence::class.java, SummaryHook)
                       XposedHelpers.findAndHookMethod(prefClass, "performClick", ClickHook)
                   } catch (t: Throwable) {
-                      XposedBridge.log("SG: performClick hook'lanamadı: ${t.message}")
+                      XposedBridge.log("SG: Preference hook hatası: ${t.message}")
+                  }
+
+                  try {
+                      XposedHelpers.findAndHookMethod(TextView::class.java, "setText", CharSequence::class.java, TextViewHook)
+                      XposedHelpers.findAndHookMethod(
+                          TextView::class.java, "setText",
+                          CharSequence::class.java, TextView.BufferType::class.java, TextViewHook
+                      )
+                  } catch (t: Throwable) {
+                      XposedBridge.log("SG: TextView hook hatası: ${t.message}")
                   }
 
                   XposedBridge.log("SG: Settings Guard aktif")
@@ -195,22 +194,20 @@ jobs:
                   override fun beforeHookedMethod(param: MethodHookParam) {
                       val pref = param.thisObject ?: return
                       val value = param.args[0] as? CharSequence ?: return
+                      if (value.toString() == Guard.MASK) return
 
-                      if (LOG_KEYS) {
-                          XposedBridge.log(
-                              "SG pref key=${runCatching { XposedHelpers.callMethod(pref, "getKey") }.getOrNull()} " +
-                                  "title=${runCatching { XposedHelpers.callMethod(pref, "getTitle") }.getOrNull()} " +
-                                  "summary=$value"
-                          )
+                      val label = Sensitive.labelOf(pref)
+                      if (LOG_KEYS) XposedBridge.log("SG pref label=$label")
+
+                      val sensitive = !Sensitive.isEmptyValue(value) &&
+                          (Sensitive.isSensitiveLabel(label) || Sensitive.isSensitiveValue(value))
+                      if (!sensitive) {
+                          Guard.forget(pref)
+                          return
                       }
 
-                      if (!Sensitive.isSensitive(pref)) return
-                      if (value.toString() == Guard.MASK) return
-                      if (Sensitive.isEmptyValue(value)) return
-
-                      Guard.real[pref] = value
+                      Guard.remember(pref, value)
                       if (Guard.isUnlocked(pref)) return
-
                       param.args[0] = Guard.MASK
                   }
               }
@@ -218,19 +215,39 @@ jobs:
               private object ClickHook : XC_MethodHook() {
                   override fun beforeHookedMethod(param: MethodHookParam) {
                       val pref = param.thisObject ?: return
-                      if (!Sensitive.isSensitive(pref)) return
-                      if (Guard.real[pref] == null) return
-                      if (Guard.isUnlocked(pref)) return
+                      if (!Guard.hasSecret(pref) || Guard.isUnlocked(pref)) return
 
                       param.result = null
-
                       val ctx = runCatching {
-                          XposedHelpers.callMethod(pref, "getContext") as? android.content.Context
-                      }.getOrNull() ?: return
-                      val activity = ctx.findActivity() ?: return
+                          XposedHelpers.callMethod(pref, "getContext") as? Context
+                      }.getOrNull()
+                      Guard.requestReveal(pref, ctx) { XposedHelpers.callMethod(pref, "setSummary", it) }
+                  }
+              }
 
-                      Auth.authenticate(activity) {
-                          Guard.reveal(pref)
+              private object TextViewHook : XC_MethodHook() {
+                  override fun beforeHookedMethod(param: MethodHookParam) {
+                      val tv = param.thisObject as? TextView ?: return
+                      if (tv is EditText) return
+                      val value = param.args[0] as? CharSequence ?: return
+                      if (value.toString() == Guard.MASK) return
+
+                      if (LOG_KEYS && Sensitive.isSensitiveValue(value)) {
+                          XposedBridge.log("SG textview sınıfı=${tv.javaClass.name}")
+                      }
+
+                      if (value.isEmpty() || !Sensitive.isSensitiveValue(value)) {
+                          Guard.forget(tv)
+                          return
+                      }
+
+                      Guard.remember(tv, value)
+                      if (Guard.isUnlocked(tv)) return
+
+                      param.args[0] = Guard.MASK
+                      tv.isClickable = true
+                      tv.setOnClickListener {
+                          Guard.requestReveal(tv, tv.context) { tv.text = it }
                       }
                   }
               }
@@ -244,19 +261,32 @@ jobs:
 
           object Sensitive {
 
-              private val keywords = listOf("imei", "serial", "seri numar", "seri no")
+              private val labelKeywords = listOf(
+                  "imei", "serial", "seri numar", "telefon numar", "phone number",
+                  "phone_number", "msisdn", "line1"
+              )
+
+              private val imeiRegex = Regex("""\d{2}[- ]?\d{6}[- ]?\d{6}[- ]?\d|\d{14,17}""")
 
               private val emptyValues = setOf(
                   "", "-", "--", "n/a", "na", "none", "unknown", "bilinmiyor", "bilinmeyen", "not available"
               )
 
-              fun isSensitive(pref: Any): Boolean {
+              fun labelOf(pref: Any): String {
                   val key = runCatching { XposedHelpers.callMethod(pref, "getKey") as? String }
                       .getOrNull().orEmpty()
                   val title = runCatching { XposedHelpers.callMethod(pref, "getTitle")?.toString() }
                       .getOrNull().orEmpty()
-                  val haystack = "$key $title".lowercase()
-                  return keywords.any { haystack.contains(it) }
+                  return "$key $title".lowercase()
+              }
+
+              fun isSensitiveLabel(label: String): Boolean =
+                  labelKeywords.any { label.contains(it) }
+
+              fun isSensitiveValue(value: CharSequence): Boolean {
+                  val v = value.toString().trim()
+                  if (imeiRegex.matches(v)) return true
+                  return v.startsWith("+") && v.count { it.isDigit() } >= 10
               }
 
               fun isEmptyValue(value: CharSequence): Boolean {
@@ -269,10 +299,10 @@ jobs:
           cat > "app/src/main/java/$PKG/Guard.kt" <<'EOF'
           package com.example.settingsguard
 
+          import android.content.Context
           import android.os.Handler
           import android.os.Looper
           import android.os.SystemClock
-          import de.robv.android.xposed.XposedHelpers
           import java.util.WeakHashMap
 
           object Guard {
@@ -280,22 +310,34 @@ jobs:
               const val MASK = "••••••••"
               private const val REVEAL_MS = 15_000L
 
-              val real = WeakHashMap<Any, CharSequence>()
-
+              private val real = WeakHashMap<Any, CharSequence>()
               private val unlockedUntil = WeakHashMap<Any, Long>()
 
-              fun isUnlocked(pref: Any): Boolean =
-                  (unlockedUntil[pref] ?: 0L) > SystemClock.elapsedRealtime()
+              fun remember(target: Any, value: CharSequence) {
+                  real[target] = value
+              }
 
-              fun reveal(pref: Any) {
-                  unlockedUntil[pref] = SystemClock.elapsedRealtime() + REVEAL_MS
+              fun forget(target: Any) {
+                  real.remove(target)
+              }
 
-                  val value = real[pref] ?: return
-                  XposedHelpers.callMethod(pref, "setSummary", value)
+              fun hasSecret(target: Any): Boolean = real.containsKey(target)
+
+              fun isUnlocked(target: Any): Boolean =
+                  (unlockedUntil[target] ?: 0L) > SystemClock.elapsedRealtime()
+
+              fun requestReveal(target: Any, context: Context?, render: (CharSequence) -> Unit) {
+                  val activity = context?.findActivity() ?: return
+                  Auth.authenticate(activity) { reveal(target, render) }
+              }
+
+              private fun reveal(target: Any, render: (CharSequence) -> Unit) {
+                  unlockedUntil[target] = SystemClock.elapsedRealtime() + REVEAL_MS
+                  real[target]?.let(render)
 
                   Handler(Looper.getMainLooper()).postDelayed({
-                      unlockedUntil.remove(pref)
-                      XposedHelpers.callMethod(pref, "setSummary", MASK)
+                      unlockedUntil.remove(target)
+                      render(MASK)
                   }, REVEAL_MS)
               }
           }
@@ -329,7 +371,7 @@ jobs:
                   val executor = activity.mainExecutor
                   val prompt = BiometricPrompt.Builder(activity)
                       .setTitle("Cihaz bilgileri")
-                      .setSubtitle("Seri numara / IMEI görüntülemek için doğrulayın")
+                      .setSubtitle("Seri numara / IMEI / telefon numarası görüntülemek için doğrulayın")
                       .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
                       .setNegativeButton("İptal", executor) { _, _ -> }
                       .build()
